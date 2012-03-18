@@ -48,6 +48,8 @@ class _Data:
 
 class FileBackend(object):
     def __init__(self, directory):
+        if not os.path.exists(directory):
+            os.makedirs(directory)
         self.directory = directory
     
     def put(self, key, data):
@@ -66,4 +68,23 @@ class FileBackend(object):
         try:
             os.remove(path)
         except OSError:
+            pass
+
+
+class BeakerBackend(object):
+    def __init__(self, session):
+        self.session = session
+    
+    def put(self, key, data):
+        self.session[key] = data
+        self.session.save()
+    
+    def get(self, key):
+        data = self.session.get(key)
+        return data
+    
+    def delete(self, key):
+        try:
+            del self.session[key]
+        except KeyError:
             pass

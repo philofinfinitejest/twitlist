@@ -2,6 +2,7 @@ import gevent
 from gevent.queue import Queue
 import requests.async
 import requests
+from urllib2 import HTTPError
 import atrest
 import json
 import math
@@ -9,9 +10,11 @@ import copy
 from sets import Set
 from oauth_hook import OAuthHook
 from urlparse import parse_qsl
+import logging
 
+logger = logging.getLogger()
 
-USER_CALL_COUNT = 80
+USER_CALL_COUNT = 50
 SUPER_USER_FILTER = 50000
 FOLLOWED_COUNT_FILTER = 2
 INTERSECTION_FILTER = 0.5
@@ -73,12 +76,15 @@ class TwitterRestAPI(object):
     def userdetails(self, userids):
         path = "/users/lookup.json"
         details = []
+        calls = []
         for i in xrange(int(math.ceil(float(len(userids)) / 100))):
             ileft = 100 * i
             iright = ileft + 100
             params = {"user_id" : ",".join(str(u) for u in userids[ileft:iright])}
-            response = self.call(path, params)
-            det = json.loads(response)
+            calls.append(gevent.spawn(self.call, path, params))
+        gevent.joinall(calls)
+        for c in calls:
+            det = json.loads(c.value)
             details.extend(det)
         return details
 
@@ -91,9 +97,8 @@ class TwitterRestAPI(object):
             resp = self.cache.fetch(keys)
         if resp:
             return resp.text
-        
         if self.token and self.secret:
-            oauth_hook = cls.hook(access_token=self.token, access_token_secret=self.secret, header_auth=True)
+            oauth_hook = TwitterOAuthHandler.hook(access_token=self.token, access_token_secret=self.secret, header_auth=False)
             client = requests.session(hooks={'pre_request': oauth_hook})
         else:
             client = requests
@@ -122,21 +127,14 @@ class Grouper(object):
         user_details.sort(key=lambda d: d["followers_count"] / float(d["friends_count"] + 1))
         user_details = user_details[(-1 * USER_CALL_COUNT):]
 
-        #generate rest calls
+        #join rest api calling and result processing green threads 
         following_calls = [gevent.spawn(self._following_call, user["id"]) for user in user_details]
-        
-        # queue querying generator
-        def user_foll_gen():
-            for _ in xrange(len(following_calls)):
-                queued = self.following_queue.get()
-                if queued is not None:
-                    yield queued
-        bucket_gen = gevent.spawn(self._generate_follower_buckets, user_foll_gen)
-        #join api calls and result processing events
+        bucket_gen = gevent.spawn(self._generate_follower_buckets, len(following_calls))
         gevent.joinall(following_calls + [bucket_gen])
-        return self.follower_buckets
+        return self._convert_buckets_to_groups(self.follower_buckets)
 
     def _extract_power_user_group(self, user_details):
+        '''removes power users from consideration based on the SUPER_USER_FILTER integer'''
         #powerusers list will be stored in the object as an attribute
         power_users = []
         remaining_users = []
@@ -149,16 +147,28 @@ class Grouper(object):
         return remaining_users
 
     def _following_call(self, user_id):
+        
+        '''get followeds for user'''
         following = None
         try:
             resp = self.restapi.following(user_id=user_id)
             following = (user_id, resp["ids"])
+        except:
+            logger.exception("Call for user_id %i failed", user_id)
         finally:
             self.following_queue.put(following) 
 
-    def _generate_follower_buckets(self, user_following):
+    def _generate_follower_buckets(self, bucket_count):
+        '''convert list of followers and their followeds to list of followeds and their followers'''
+        # queue-querying generator
+        def user_foll_gen():
+            for _ in xrange(bucket_count):
+                queued = self.following_queue.get()
+                if queued is not None:
+                    yield queued
+
         follower_buckets = {}
-        for user, following in user_following():
+        for user, following in user_foll_gen():
             for followed in following:
                 if followed in follower_buckets:
                     follower_buckets[followed].add(user)
@@ -169,6 +179,7 @@ class Grouper(object):
         self.follower_buckets = self._consolidate_follower_buckets(follower_buckets)
 
     def _consolidate_follower_buckets(self, follower_buckets):
+        '''Merge buckets that have enough followers in common, calculated using the INTERSECTION_FILTER multiplier.'''
         merged_buckets = follower_buckets
         #reverse iteration to enable deletion
         for idx in xrange(len(follower_buckets) - 1, -1, -1):
@@ -186,35 +197,31 @@ class Grouper(object):
                     merge_bucket.update(bucket)
                     follower_buckets.pop(idx)
                     break
+        # filter out all buckets with a low correspondence score
         follower_buckets = [(similarities, user_ids) for similarities, user_ids in merged_buckets if len(similarities) > CORRESPONDENCE_FILTER] 
-        self._extend_user_details(list(set(user_id for similarities, _ in follower_buckets for user_id in similarities)))
+        # load details for surviving followed accounts for display
+        user_ids = list(set(user_id for similarities, _ in follower_buckets for user_id in similarities))
+        try:
+            self.user_det.update((user["id"], user) for user in self.restapi.userdetails(user_ids))
+        except:
+            logger.exception("User details update failed.")
         return follower_buckets
 
-    def _extend_user_details(self, user_ids):
-        self.user_det.update((user["id"], user) for user in self.restapi.userdetails(user_ids))
-
     def _convert_buckets_to_groups(self, follower_buckets):
-        return [([self.user_det[uid]["name"] for uid in similarities], [self.user_det[uid]["name"] for uid in user_ids])
+        '''converts sets of ids to lists of full user details'''
+        return [([self.user_det[uid] for uid in similarities if uid in self.user_det], [self.user_det[uid] for uid in user_ids if uid in self.user_det])
             for similarities, user_ids in follower_buckets]
 
 
 def test():
-    api = TwitterRestAPI(cache=atrest.Cache(atrest.FileBackend('.cache'), 3600))
+    logging.basicConfig(format='%(asctime)s %(message)s',level=logging.DEBUG)
+    api = TwitterRestAPI(cache=atrest.Cache(atrest.FileBackend('/tmp/atrest_cache'), 3600))
     grouper = Grouper(api)
-    grouper.generate_groups(user_name='phildlv')
-    print grouper.follower_buckets
-    print [([grouper.user_det[uid]["screen_name"] for uid in followeds if grouper.user_det.has_key(uid)], [grouper.user_det[uid]["screen_name"] for uid in followers if grouper.user_det.has_key(uid)]) for followeds, followers in grouper.follower_buckets]
+    groups = grouper.generate_groups(user_name='phildlv')
+    for followeds, followers in groups:
+        print [user["screen_name"] for user in followeds]
+        print [user["screen_name"] for user in followers]
+        print ''
 
 if __name__ == '__main__':
     test()
-'''
-x- score = followers / following + 1
-
-x- using top 100 by score, 
-
-x- construct buckets of following relationships: {followed_user_id, [follower_from_list,]} (async => gevent)
-starting with largest bucket, declare a group.
-- other groups can extend that group if they have a large enough percentage of identical members,
-otherwise, they become a new group.
-- Those groups that were formed by 5 or more groups being merged are coherent enough to recommend as groups to follow.
-'''
