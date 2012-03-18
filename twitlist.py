@@ -131,7 +131,7 @@ class Grouper(object):
         following_calls = [gevent.spawn(self._following_call, user["id"]) for user in user_details]
         bucket_gen = gevent.spawn(self._generate_follower_buckets, len(following_calls))
         gevent.joinall(following_calls + [bucket_gen])
-        return self._convert_buckets_to_groups(self.follower_buckets)
+        return list(self._gen_buckets_to_groups(self.follower_buckets))
 
     def _extract_power_user_group(self, user_details):
         '''removes power users from consideration based on the SUPER_USER_FILTER integer'''
@@ -207,10 +207,24 @@ class Grouper(object):
             logger.exception("User details update failed.")
         return follower_buckets
 
-    def _convert_buckets_to_groups(self, follower_buckets):
+    def _gen_buckets_to_groups(self, follower_buckets):
         '''converts sets of ids to lists of full user details'''
-        return [([self.user_det[uid] for uid in similarities if uid in self.user_det], [self.user_det[uid] for uid in user_ids if uid in self.user_det])
-            for similarities, user_ids in follower_buckets]
+        for similarities, user_ids in follower_buckets:
+            sim_det, user_det = ([self.user_det[uid] for uid in similarities if uid in self.user_det], [self.user_det[uid] for uid in user_ids if uid in self.user_det])
+            description = ""
+            for count, user in enumerate(user_det[:3]):
+                for word in user["description"].split(' '):
+                    word = "".join(c for c in word if c not in (',', '.', "'", '"')).title()
+                    if len(word) > 4:
+                        description += word
+                        if count == 0:
+                            description += "'s "
+                        elif count == 1:
+                            description += "ful "
+                        elif count == 2:
+                            description += "s"
+                        break
+            yield description, sim_det, user_det
 
 
 def test():
@@ -218,9 +232,10 @@ def test():
     api = TwitterRestAPI(cache=atrest.Cache(atrest.FileBackend('/tmp/atrest_cache'), 3600))
     grouper = Grouper(api)
     groups = grouper.generate_groups(user_name='phildlv')
-    for followeds, followers in groups:
-        print [user["screen_name"] for user in followeds]
-        print [user["screen_name"] for user in followers]
+    for desc, followeds, followers in groups:
+        print desc
+        print [user["description"] for user in followeds]
+        print [user["description"] for user in followers]
         print ''
 
 if __name__ == '__main__':
