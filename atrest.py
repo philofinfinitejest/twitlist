@@ -1,9 +1,13 @@
 import os
+import types
 import time
 import hashlib
 import requests
 import cPickle as pickle
 
+'''
+Cached objects must be picklable. It is the responsibility of the client to ensure this.
+'''
 
 class Cache:
     def __init__(self, backend, timeout_seconds, persist_errors=False):
@@ -13,7 +17,7 @@ class Cache:
 
     def store(self, keys, response):
         key = self._make_key(keys)
-        data = _Data(time.time() + self.timeout_seconds, response.headers, response.encoding, response.status_code, response.text)
+        data = _Data(time.time() + self.timeout_seconds, response)
         self.backend.put(key, data)
 
     def fetch(self, keys):
@@ -31,19 +35,16 @@ class Cache:
         return make_key.hexdigest()
 
 
-class _Data:
-    def __init__(self,
-        timeout,
-        headers, 
-        encoding,
-        status_code,
-        text):
-
+class _Data(object):
+    '''Cache DTO'''
+    def __init__(self, timeout, data):
         self.timeout = timeout
-        self.headers = headers
-        self.encoding = encoding
-        self.status_code = status_code
-        self.text = text
+        self.data = data
+
+    def __getattr__(self, name):
+        if 'data' in self.__dict__:
+            return getattr(self.data, name)
+        raise AttributeError
 
 
 class FileBackend(object):
