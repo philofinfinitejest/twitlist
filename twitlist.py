@@ -14,7 +14,7 @@ import logging
 
 logger = logging.getLogger()
 
-USER_CALL_COUNT = 1
+USER_CALL_COUNT = 100
 SUPER_USER_FILTER = 50000
 FOLLOWED_COUNT_FILTER = 2
 INTERSECTION_FILTER = 0.5
@@ -25,6 +25,20 @@ AUTHORIZE_URL = 'https://twitter.com/oauth/authorize'
 ACCESS_TOKEN_URL = 'https://twitter.com/oauth/access_token'
 REST_API_ROOT = 'https://api.twitter.com/1'
 
+
+# Notification hook decorator
+def notify(func, *args, **kargs):
+    '''This decorates class instance methods, the instance of which has a notifier.'''
+    def wrapper(self, *args, **kargs):
+        result = func(self, *args, **kargs)
+        if hasattr(self, 'notifier'):
+            if hasattr(self.notifier, 'step'):
+                self.notifier.step()
+        return result
+    return wrapper
+
+class CacheResponse(object):
+    pass
 
 class TwitterOAuthHandler(object):
     @classmethod
@@ -56,11 +70,12 @@ class TwitterOAuthHandler(object):
 
 
 class TwitterRestAPI(object):
-    def __init__(self, oauth_token=None, oauth_secret=None, cache=None):
+    def __init__(self, oauth_token=None, oauth_secret=None, cache=None, notifier=None):
         self.apiroot = REST_API_ROOT
         self.cache = cache
         self.token = oauth_token
         self.secret = oauth_secret
+        self.notifier = notifier
     
     def following(self, user_id=None, user_name=None):
         path = "/friends/ids.json"
@@ -88,6 +103,7 @@ class TwitterRestAPI(object):
             details.extend(det)
         return details
 
+    @notify
     def call(self, relative_path, params={}):
         path = "%s%s" % (self.apiroot, relative_path)
         if self.cache:
@@ -113,9 +129,6 @@ class TwitterRestAPI(object):
         self.cache.store(keys, cacheresp)
         return cacheresp.text
 
-class CacheResponse(object):
-    pass
-
 
 class Grouper(object):
     '''Contains the logic for getting and analyzing group relationships for a user's followeds'''
@@ -123,8 +136,19 @@ class Grouper(object):
         self.restapi = restapi
 
     def generate_groups(self, user_id=None, user_name=None, notification_hook=None):
-        #TODO: add notification hook to allow for notication of the caller of the progress made (e.g. for progress bars)
-        self.following_queue = Queue()
+        '''
+        Either user_id or user_name must be provided. notification_hook is an optional object to which notification of completion of 
+        intermediate steps and final completion will be sent via 'setup', 'step', and 'finish' methods.
+        Returns a dictionary of dictionaries:
+        {key: <some int>: {
+            "description": <some string>, "user_details": <a dictionary of twitter user-details results>, "similarities": <a list of user-ids that bind the group>}
+        }
+        '''
+        if notification_hook:
+            step_count = 2 + USER_CALL_COUNT + 2
+            self.notification_hook = notification_hook
+            notification_hook.setup(step_count)
+        self.restapi.notifier = notification_hook
         self.user_id = user_id
         self.user_name = user_name
         following = self.restapi.following(user_id, user_name)
@@ -136,10 +160,14 @@ class Grouper(object):
         user_details.sort(key=lambda d: d["followers_count"] / float(d["friends_count"] + 1))
         user_details = user_details[(-1 * USER_CALL_COUNT):]
         #join rest api calling and result processing green threads 
+        self.following_queue = Queue()
         following_calls = [gevent.spawn(self._following_call, user["id"]) for user in user_details]
         bucket_gen = gevent.spawn(self._generate_follower_buckets, len(following_calls), notification_hook)
         gevent.joinall(following_calls + [bucket_gen])
-        return list(self._gen_buckets_to_groups(self.follower_buckets))
+        groups = dict(self._gen_buckets_to_groups(self.follower_buckets))
+        if notification_hook:
+            notification_hook.finish()
+        return groups
 
     def _extract_power_user_group(self, user_details):
         '''removes power users from consideration based on the SUPER_USER_FILTER integer'''
@@ -165,20 +193,13 @@ class Grouper(object):
         finally:
             self.following_queue.put(following) 
 
-    def _generate_follower_buckets(self, bucket_count, notification_hook=None):
+    @notify
+    def _generate_follower_buckets(self, bucket_count, notification_hook):
         '''convert list of followers and their followeds to list of followeds and their followers'''
-        if not notification_hook:
-            # do nothing hook
-            class nh(object):
-                def __getattribute__(self, name):
-                    return lambda *x, **y : None
-            notification_hook = nh()
-        notification_hook.setup(step_count=bucket_count)
         # queue-querying generator
         def user_foll_gen():
             for _ in xrange(bucket_count):
                 queued = self.following_queue.get()
-                notification_hook.step()
                 if queued is not None:
                     yield queued
         follower_buckets = {}
@@ -191,7 +212,6 @@ class Grouper(object):
         # filter out low scoring followeds and convert to list of set 2-tuples
         follower_buckets = list((Set([k]),v) for k,v in follower_buckets.items() if len(v) > FOLLOWED_COUNT_FILTER)
         self.follower_buckets = self._consolidate_follower_buckets(follower_buckets)
-        notification_hook.finish()
 
     def _consolidate_follower_buckets(self, follower_buckets):
         '''Merge buckets that have enough followers in common, calculated using the INTERSECTION_FILTER multiplier.'''
@@ -216,16 +236,12 @@ class Grouper(object):
         follower_buckets = [(similarities, user_ids) 
             for similarities, user_ids in merged_buckets 
                 if len(similarities) > CORRESPONDENCE_FILTER] 
-        #TODO: restore if proves useful at all (03/18/12): load details for surviving followed accounts for display
-        #user_ids = list(set(user_id for similarities, _ in follower_buckets for user_id in similarities))
-        #try:
-        #    self.user_det.update((user["id"], user) for user in self.restapi.userdetails(user_ids))
-        #except:
-        #    logger.exception("User details update failed.")
         return follower_buckets
 
+    @notify
     def _gen_buckets_to_groups(self, follower_buckets):
         '''converts sets of ids to lists of full user details'''
+        index = 0
         for similarities, user_ids in follower_buckets:
             user_det = [self.user_det[uid] for uid in user_ids if uid in self.user_det]
             description = ""
@@ -243,14 +259,33 @@ class Grouper(object):
                         break
                 if count > 2:
                     break
-            yield (description, user_det)
+            yield (index, {"description": description, "user_details": user_det, "similarities": list(similarities)})
+            index += 1
 
 
 def test():
+    class ProgressNotifier(object):
+        def __init__(self):
+            self.step_state = 0
+
+        def setup(self, step_count):
+            self.step_count = step_count
+            print self.step_state
+
+        def step(self):
+            step_value = 100.0 / self.step_count
+            self.step_state += step_value 
+            print self.step_count, int(self.step_state)
+            
+        def finish(self):
+            self.step_state = 100
+            print self.step_state
+
     logging.basicConfig(format='%(asctime)s %(message)s',level=logging.DEBUG)
     api = TwitterRestAPI(cache=atrest.Cache(atrest.FileBackend('/tmp/atrest_cache'), 3600))
     grouper = Grouper(api)
-    groups = grouper.generate_groups(user_name='phildlv')
+    nh = ProgressNotifier()
+    groups = grouper.generate_groups(user_name='phildlv', notification_hook=nh)
     for desc, followers in groups:
         print desc
         print [user["description"] for user in followers]

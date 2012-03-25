@@ -10,14 +10,13 @@ Cached objects must be picklable. It is the responsibility of the client to ensu
 '''
 
 class Cache:
-    def __init__(self, backend, timeout_seconds, persist_errors=False):
+    def __init__(self, backend, timeout_seconds):
         self.timeout_seconds = timeout_seconds
         self.backend = backend
-        self.persist_erros = persist_errors
 
-    def store(self, keys, response):
+    def store(self, keys, value):
         key = self._make_key(keys)
-        data = _Data(time.time() + self.timeout_seconds, response)
+        data = _Data(time.time() + self.timeout_seconds, value)
         self.backend.put(key, data)
 
     def fetch(self, keys):
@@ -26,12 +25,17 @@ class Cache:
         if data is not None and data.timeout < time.time():
             data = None
             self.backend.delete(key)
-        return data
+        return data.data if data is not None else None
+
+    def delete(self, keys):
+        key = self._make_key(keys)
+        self.backend.delete(key)
 
     def _make_key(self, keys):
         make_key = hashlib.sha1()
         for key in keys:
-            make_key.update(key)
+            if key is not None:
+                make_key.update(key)
         return make_key.hexdigest()
 
 
@@ -40,11 +44,6 @@ class _Data(object):
     def __init__(self, timeout, data):
         self.timeout = timeout
         self.data = data
-
-    def __getattr__(self, name):
-        if 'data' in self.__dict__:
-            return getattr(self.data, name)
-        raise AttributeError
 
 
 class FileBackend(object):
