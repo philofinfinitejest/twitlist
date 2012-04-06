@@ -1,0 +1,7 @@
+Twitter Rest API interface and caching.
+
+Dependencies:
+requests
+requests-oauth
+gevent
+
