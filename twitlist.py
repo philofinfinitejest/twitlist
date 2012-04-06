@@ -14,11 +14,11 @@ import logging
 
 logger = logging.getLogger()
 
-USER_CALL_COUNT = 100
+USER_CALL_COUNT = 150
 SUPER_USER_FILTER = 50000
 FOLLOWED_COUNT_FILTER = 2
-INTERSECTION_FILTER = 0.5
-CORRESPONDENCE_FILTER = 10
+INTERSECTION_FILTER = 0.4
+CORRESPONDENCE_FILTER = 15
 
 REQUEST_TOKEN_URL = 'https://api.twitter.com/oauth/request_token'
 AUTHORIZE_URL = 'https://twitter.com/oauth/authorize'
@@ -102,9 +102,21 @@ class TwitterRestAPI(object):
             det = json.loads(c.value)
             details.extend(det)
         return details
+    
+    def makelist(self, name, description, userids):
+        createpath = "/lists/create.json"
+        addpath = "/lists/members/create_all.json"
+        params = {"name":name[0:25], "description":description}
+        response = self.call(createpath, params, header_auth=True, post=True)
+        response = json.loads(response)
+        listid = response["id_str"]
+        params = {"list_id":listid, "user_id":",".join(str(u) for u in userids)}
+        print params
+        self.call(addpath, params, header_auth=True, post=True)
+        return response
 
     @notify
-    def call(self, relative_path, params={}):
+    def call(self, relative_path, params={}, header_auth=False, post=False):
         path = "%s%s" % (self.apiroot, relative_path)
         if self.cache:
             keys = [path, json.dumps(params)]
@@ -114,12 +126,19 @@ class TwitterRestAPI(object):
         if resp:
             return resp.text
         if self.token and self.secret:
-            oauth_hook = TwitterOAuthHandler.hook(access_token=self.token, access_token_secret=self.secret, header_auth=False)
+            oauth_hook = TwitterOAuthHandler.hook(access_token=self.token, access_token_secret=self.secret, header_auth=header_auth)
             client = requests.session(hooks={'pre_request': oauth_hook})
         else:
             client = requests
-        resp = client.get(path, params=params)
-        resp.raise_for_status()
+        if post:
+            resp = client.post(path, data=params)
+        else:
+            resp = client.get(path, params=params)
+        try:
+            resp.raise_for_status()
+        except Exception:
+            logger.exception(resp.text)
+            raise
         # make cachable (picklable and read-repeatable) vesion of response
         cacheresp = CacheResponse()
         cacheresp.headers = resp.headers
@@ -160,9 +179,10 @@ class Grouper(object):
         user_details.sort(key=lambda d: d["followers_count"] / float(d["friends_count"] + 1))
         user_details = user_details[(-1 * USER_CALL_COUNT):]
         #join rest api calling and result processing green threads 
+        pool = gevent.pool.Pool(size=20)
         self.following_queue = Queue()
-        following_calls = [gevent.spawn(self._following_call, user["id"]) for user in user_details]
-        bucket_gen = gevent.spawn(self._generate_follower_buckets, len(following_calls), notification_hook)
+        bucket_gen = pool.spawn(self._generate_follower_buckets, len(user_details))
+        following_calls = [pool.spawn(self._following_call, user["id"]) for user in user_details]
         gevent.joinall(following_calls + [bucket_gen])
         groups = dict(self._gen_buckets_to_groups(self.follower_buckets))
         if notification_hook:
@@ -194,7 +214,7 @@ class Grouper(object):
             self.following_queue.put(following) 
 
     @notify
-    def _generate_follower_buckets(self, bucket_count, notification_hook):
+    def _generate_follower_buckets(self, bucket_count):
         '''convert list of followers and their followeds to list of followeds and their followers'''
         # queue-querying generator
         def user_foll_gen():
