@@ -240,6 +240,8 @@ class Grouper(object):
         for idx in xrange(len(follower_buckets) - 1, -1, -1):
             user_ids, bucket = follower_buckets[idx] 
             for merge_ids, merge_bucket in merged_buckets:
+                # yield to other greenlets
+                gevent.sleep(0)
                 if user_ids == merge_ids:
                     # itself
                     continue
@@ -267,6 +269,8 @@ class Grouper(object):
             description = ""
             count = 0
             for user in user_det:
+                # yield to other greenlets
+                gevent.sleep(0)
                 for word in user["description"].split(' '):
                     word = "".join(c for c in word if c not in (',', '.', "'", '"')).title()
                     if len(word) > 4:
