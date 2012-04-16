@@ -16,8 +16,8 @@ logger = logging.getLogger()
 
 USER_CALL_COUNT = 150
 SUPER_USER_FILTER = 50000
-FOLLOWED_COUNT_FILTER = 2
-INTERSECTION_FILTER = 0.4
+FOLLOWED_COUNT_FILTER = 5
+INTERSECTION_FILTER = 0.6
 CORRESPONDENCE_FILTER = 15
 
 REQUEST_TOKEN_URL = 'https://api.twitter.com/oauth/request_token'
@@ -111,7 +111,6 @@ class TwitterRestAPI(object):
         response = json.loads(response)
         listid = response["id_str"]
         params = {"list_id":listid, "user_id":",".join(str(u) for u in userids)}
-        print params
         self.call(addpath, params, header_auth=True, post=True)
         return response
 
