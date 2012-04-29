@@ -15,7 +15,7 @@ import logging
 logger = logging.getLogger()
 
 USER_CALL_COUNT = 150
-SUPER_USER_FILTER = 50000
+SUPER_USER_FILTER = 100000
 FOLLOWED_COUNT_FILTER = 5
 INTERSECTION_FILTER = 0.6
 CORRESPONDENCE_FILTER = 15
@@ -117,6 +117,7 @@ class TwitterRestAPI(object):
     @notify
     def call(self, relative_path, params={}, header_auth=False, post=False):
         path = "%s%s" % (self.apiroot, relative_path)
+        resp = None
         if self.cache:
             keys = [path, json.dumps(params)]
             if self.token and self.secret:
@@ -135,17 +136,18 @@ class TwitterRestAPI(object):
             resp = client.get(path, params=params)
         try:
             resp.raise_for_status()
-        except Exception:
+        except requests.HTTPError:
             logger.exception(resp.text)
             raise
         # make cachable (picklable and read-repeatable) vesion of response
-        cacheresp = CacheResponse()
-        cacheresp.headers = resp.headers
-        cacheresp.encoding = resp.encoding
-        cacheresp.status_code = resp.status_code
-        cacheresp.text = resp.text
-        self.cache.store(keys, cacheresp)
-        return cacheresp.text
+        if self.cache:
+            cacheresp = CacheResponse()
+            cacheresp.headers = resp.headers
+            cacheresp.encoding = resp.encoding
+            cacheresp.status_code = resp.status_code
+            cacheresp.text = resp.text
+            self.cache.store(keys, cacheresp)
+        return resp.text
 
 
 class Grouper(object):
@@ -162,6 +164,7 @@ class Grouper(object):
             "description": <some string>, "user_details": <a dictionary of twitter user-details results>, "similarities": <a list of user-ids that bind the group>}
         }
         '''
+        gevent.sleep(0)
         if notification_hook:
             step_count = 2 + USER_CALL_COUNT + 2
             self.notification_hook = notification_hook
@@ -190,6 +193,7 @@ class Grouper(object):
 
     def _extract_power_user_group(self, user_details):
         '''removes power users from consideration based on the SUPER_USER_FILTER integer'''
+        gevent.sleep(0)
         #powerusers list will be stored in the object as an attribute
         power_users = []
         remaining_users = []
@@ -215,6 +219,7 @@ class Grouper(object):
     @notify
     def _generate_follower_buckets(self, bucket_count):
         '''convert list of followers and their followeds to list of followeds and their followers'''
+        gevent.sleep(0)
         # queue-querying generator
         def user_foll_gen():
             for _ in xrange(bucket_count):
@@ -228,12 +233,20 @@ class Grouper(object):
                     follower_buckets[followed].add(user)
                 else:
                     follower_buckets[followed] = Set([user])
-        # filter out low scoring followeds and convert to list of set 2-tuples
-        follower_buckets = list((Set([k]),v) for k,v in follower_buckets.items() if len(v) > FOLLOWED_COUNT_FILTER)
+        # filter out low scoring followeds
+        follower_buckets = list((k,v) for k,v in follower_buckets.items() if len(v) > FOLLOWED_COUNT_FILTER)
+        # filter out super-user followeds
+        followeds_details = self.restapi.userdetails(list(bucket[0] for bucket in follower_buckets))
+        valid_followeds_ids = list(det['id'] for det in followeds_details if det['followers_count'] < SUPER_USER_FILTER)
+        follower_buckets = list((Set([k]),v) for k,v in follower_buckets if k in valid_followeds_ids)
         self.follower_buckets = self._consolidate_follower_buckets(follower_buckets)
 
     def _consolidate_follower_buckets(self, follower_buckets):
-        '''Merge buckets that have enough followers in common, calculated using the INTERSECTION_FILTER multiplier.'''
+        '''
+        Merge buckets that have enough followers in common, calculated using the INTERSECTION_FILTER multiplier.
+        follower_buckets: [(Set(<followeds user id(s)>),Set(<follower user ids>)),]
+        '''
+        gevent.sleep(0)
         merged_buckets = follower_buckets
         #reverse iteration to enable deletion
         for idx in xrange(len(follower_buckets) - 1, -1, -1):
@@ -308,7 +321,7 @@ def test():
     api = TwitterRestAPI(cache=atrest.Cache(atrest.FileBackend('/tmp/atrest_cache'), 3600))
     grouper = Grouper(api)
     nh = ProgressNotifier()
-    groups = grouper.generate_groups(user_name='phildlv', notification_hook=nh)
+    groups = grouper.generate_groups(user_name='theephils', notification_hook=nh)
     for desc, followers in groups:
         print desc
         print [user["description"] for user in followers]
